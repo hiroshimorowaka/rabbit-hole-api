@@ -10,9 +10,10 @@ use diesel::result::DatabaseErrorKind;
 use futures_util::{StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde_json::json;
-use std::fs::{File, create_dir_all};
+use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::Write;
-use uuid::Uuid;
+use std::time::SystemTime;
+use uuid::{Timestamp, Uuid};
 
 type DbPool = Pool<ConnectionManager<SqliteConnection>>;
 
@@ -41,7 +42,7 @@ pub fn auth_routes(cfg: &mut web::ServiceConfig) {
 }
 
 pub fn file_routes(cfg: &mut web::ServiceConfig) {
-    cfg.service(web::resource("/upload").route(web::post().to(upload_file)))
+    cfg.service(web::resource("/upload").route(web::post().to(upload)))
         .service(web::resource("/download/{filename}").route(web::get().to(download_file)));
 }
 
@@ -155,70 +156,47 @@ async fn change_password(
     }
 }
 
-async fn upload_file(
-    req: HttpRequest,
-    pool: web::Data<DbPool>,
-    mut payload: Multipart,
-) -> impl Responder {
-    let token = req
-        .headers()
-        .get("Authorization")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("")
-        .replace("Bearer ", "");
-    let claims = verify_jwt(&token).ok_or(HttpResponse::Unauthorized().unauthorized_default_body());
-
-    let claims = match claims {
-        Ok(c) => c,
-        Err(e) => return e,
-    };
-
-    let conn = &mut pool.get().unwrap();
-    let uploader = users::dsl::users
-        .filter(users::dsl::username.eq(&claims.sub))
-        .first::<User>(conn)
-        .unwrap();
-
-    create_dir_all("uploads").unwrap();
-
-    let mut filename = String::new();
+async fn upload(mut payload: Multipart) -> impl Responder {
+    println!("Starting Upload");
     while let Ok(Some(mut field)) = payload.try_next().await {
         let content_disposition = field.content_disposition();
-        if content_disposition.is_none() {
-            return HttpResponse::BadRequest().bad_request_default_body("Arquivo inválido");
-        }
-        filename = match content_disposition.unwrap().get_filename() {
-            Some(name) => format!("{}_{}", Uuid::new_v4(), name),
-            None => format!("upload_{}", Uuid::new_v4()),
+        let filename = if let Some(fname) = content_disposition.unwrap().get_filename() {
+            fname.to_string()
+        } else {
+            format!("upload-{}", Uuid::new_v4())
         };
-        let filepath = format!("uploads/{}", filename);
-        let mut f = File::create(&filepath).unwrap();
+
+        let filepath = format!("./uploads/{}_{}", uuid::Uuid::new_v4(), filename);
+        println!("Filename: {}", filename);
+
+        // Cria o arquivo localmente
+        let mut f = match File::create(&filepath) {
+            Ok(file) => file,
+            Err(e) => {
+                return HttpResponse::InternalServerError()
+                    .body(format!("Erro ao criar arquivo: {}", e));
+            }
+        };
+        println!("Arquivo Criado");
+
+        // Escreve os chunks no arquivo
         while let Some(chunk) = field.next().await {
-            let data = chunk.unwrap();
-            f.write_all(&data).unwrap();
+            let data = match chunk {
+                Ok(data) => data,
+                Err(e) => {
+                    return HttpResponse::InternalServerError()
+                        .body(format!("Erro no chunk: {}", e));
+                }
+            };
+            if let Err(e) = f.write_all(&data) {
+                return HttpResponse::InternalServerError()
+                    .body(format!("Erro ao escrever arquivo: {}", e));
+            }
         }
-
-        let new_file = NewFile {
-            filename: filename.clone(),
-            filepath: filepath.clone(),
-            uploader_id: uploader.id,
-        };
-        diesel::insert_into(files::table)
-            .values(new_file)
-            .execute(conn)
-            .unwrap();
+        println!("Arquivo escrito");
     }
-
-    let connection_info = req.connection_info();
-    let base_url = format!("{}://{}", connection_info.scheme(), connection_info.host());
-    let download_url = format!("{}/download/{}", base_url, filename);
-
-    HttpResponse::Ok()
-        .insert_header((header::LOCATION, download_url.clone()))
-        .json(json!({
-            "filename": filename,
-            "filepath": download_url,
-        }))
+    println!("==================");
+    HttpResponse::Ok().body("Arquivo enviado com sucesso!")
 }
 
 async fn download_file(req: HttpRequest, path: web::Path<String>) -> impl Responder {

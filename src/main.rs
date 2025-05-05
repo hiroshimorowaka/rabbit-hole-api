@@ -5,7 +5,8 @@ mod models;
 mod routes;
 mod schema;
 
-use actix_web::{App, HttpServer, web};
+use actix_cors::Cors;
+use actix_web::{App, HttpServer, http, web};
 use diesel::r2d2::{self, ConnectionManager};
 use diesel::sqlite::SqliteConnection;
 use dotenvy::dotenv;
@@ -32,6 +33,17 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         App::new()
+            .wrap(
+                Cors::default()
+                    .allowed_origin("http://localhost:5173") // ou .allowed_origin_fn(...) se quiser algo dinâmico
+                    .allowed_methods(vec!["GET", "POST", "OPTIONS"])
+                    .allowed_headers(vec![
+                        http::header::AUTHORIZATION,
+                        http::header::CONTENT_TYPE,
+                    ])
+                    .supports_credentials()
+                    .max_age(3600),
+            )
             .app_data(web::Data::new(pool.clone()))
             .configure(auth_routes)
             .configure(file_routes)
